@@ -1,0 +1,47 @@
+[package]
+name = "vitals"
+version = "0.1.0"
+edition = "2021"
+description = "Vitals — host probe (探针) + metrics TSDB + enterprise dashboard for the HOLDFAST stack."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "vitals"
+path = "src/lib.rs"
+
+# The dashboard / TSDB server is the default binary (carries the `healthcheck` subcommand
+# used by the container HEALTHCHECK).
+[[bin]]
+name = "vitals-server"
+path = "src/main.rs"
+
+# The host probe agent: scrapes /proc + /sys + statvfs and POSTs batches to the server.
+[[bin]]
+name = "vitals-agent"
+path = "src/agent.rs"
+
+[dependencies]
+# HTTP framework (shared with keystone/keyward): Json/State/Query extractors, typed responses.
+axum = "0.8"
+# Async runtime axum runs on. multi-thread is load-bearing: the synchronous Store trait
+# bridges to async sqlx via block_in_place (same pattern as keystone/keyward).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# (De)serialize ingest batches / api responses / dashboard models.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ergonomic error enum -> JSON error envelope.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Portable PostgreSQL TSDB. Runtime queries only (sqlx::query/Row) — NO compile-time
+# macros, so the build needs NO database. rustls TLS (no openssl). Standard SQL only
+# (TEXT/BIGINT/DOUBLE PRECISION/PK/INDEX) so it later runs unchanged on FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+# statvfs(2) for disk usage on HOST_ROOT, and gethostname for the agent's default host id.
+# Pure FFI bindings — no C toolchain pulled.
+libc = "0.2"
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
+tower = { version = "0.5", features = ["util"] }
