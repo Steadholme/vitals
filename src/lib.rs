@@ -44,6 +44,10 @@ pub fn app(state: AppState) -> Router {
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/api/metrics", get(handlers::api::metrics))
         .route("/", get(handlers::dashboard::dashboard))
+        // Sluice forwards the gateway prefix UNMODIFIED (no strip), so a request to the
+        // `/vitals` route arrives here as `GET /vitals`. Register the dashboard as the
+        // fallback (mirrors watchtower) so the page renders behind the gateway prefix.
+        .fallback(get(handlers::dashboard::dashboard))
         .with_state(state)
 }
 
