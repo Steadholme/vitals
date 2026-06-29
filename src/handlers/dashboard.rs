@@ -24,8 +24,8 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Htm
         .unwrap_or("—");
 
     let now = now_secs();
-    let latest = state.store.latest();
-    let window = state.store.query(None, None, now - SPARK_WINDOW_SECS);
+    let latest = state.store.latest().await;
+    let window = state.store.query(None, None, now - SPARK_WINDOW_SECS).await;
     let hosts = build_host_views(&latest, &window);
 
     Html(render(&hosts, email, now))

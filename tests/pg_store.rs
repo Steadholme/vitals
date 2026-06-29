@@ -9,8 +9,8 @@
 //!   cargo test --test pg_store -- --nocapture
 //! ```
 //!
-//! Requires a multi-threaded runtime: the synchronous `Store` trait bridges to async sqlx
-//! via `block_in_place`, which only works on the multi_thread scheduler.
+//! The `Store` trait is async (PgStore drives sqlx natively, no block_in_place); the
+//! multi_thread flavor below just keeps reads parallel under load.
 
 use std::sync::Arc;
 
@@ -43,10 +43,10 @@ async fn pg_store_full_integration() {
     state.store = Arc::new(pg);
 
     // Clean any rows from a previous run for our test hosts so assertions are exact.
-    let removed = state.store.prune(i64::MAX);
+    let removed = state.store.prune(i64::MAX).await;
     eprintln!("pre-clean removed {removed} stale rows");
 
-    // --- direct Store-trait round-trip (sync over async sqlx) --------------
+    // --- direct Store-trait round-trip (async sqlx, awaited natively) ------
     state.store.insert_samples(
         "pg-node",
         &[
@@ -54,19 +54,19 @@ async fn pg_store_full_integration() {
             Sample::new("cpu_pct", 20.0, 2000),
             Sample::new("mem_pct", 55.0, 2000),
         ],
-    );
+    ).await;
     // ON CONFLICT DO NOTHING — re-insert with same (host,metric,ts) is a no-op.
-    state.store.insert_samples("pg-node", &[Sample::new("cpu_pct", 999.0, 1000)]);
+    state.store.insert_samples("pg-node", &[Sample::new("cpu_pct", 999.0, 1000)]).await;
 
-    let cpu = state.store.query(Some("pg-node"), Some("cpu_pct"), 0);
+    let cpu = state.store.query(Some("pg-node"), Some("cpu_pct"), 0).await;
     assert_eq!(cpu.len(), 2, "two cpu rows");
     assert_eq!(cpu[0].value, 10.0, "first write wins on conflict");
 
-    let since = state.store.query(Some("pg-node"), Some("cpu_pct"), 2000);
+    let since = state.store.query(Some("pg-node"), Some("cpu_pct"), 2000).await;
     assert_eq!(since.len(), 1);
     assert_eq!(since[0].value, 20.0);
 
-    let latest = state.store.latest();
+    let latest = state.store.latest().await;
     let pg_cpu = latest
         .iter()
         .find(|r| r.host == "pg-node" && r.metric == "cpu_pct")
@@ -75,9 +75,9 @@ async fn pg_store_full_integration() {
     assert_eq!(pg_cpu.ts, 2000);
 
     // --- retention prune ---------------------------------------------------
-    let pruned = state.store.prune(1500);
+    let pruned = state.store.prune(1500).await;
     assert_eq!(pruned, 1, "the ts=1000 cpu row is pruned");
-    assert!(state.store.query(Some("pg-node"), Some("cpu_pct"), 0).len() == 1);
+    assert!(state.store.query(Some("pg-node"), Some("cpu_pct"), 0).await.len() == 1);
 
     // --- full HTTP flow through the PG-backed app --------------------------
     let body = json!({
@@ -112,7 +112,7 @@ async fn pg_store_full_integration() {
     assert!(html.contains("pg-http"), "PG-backed host on dashboard");
 
     // Final cleanup so reruns start clean.
-    let _ = state.store.prune(i64::MAX);
+    let _ = state.store.prune(i64::MAX).await;
 
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + insert/query/latest/prune \

@@ -48,7 +48,7 @@ async fn dashboard_shows_host_gauges_and_injected_email() {
             Sample::new("mem_total_bytes", 16_000_000_000.0, now),
             Sample::new("uptime_secs", 90_061.0, now),
         ],
-    );
+    ).await;
 
     let (status, html) = get_html(&state, Some("ops@holdfast.local")).await;
     assert_eq!(status, StatusCode::OK);

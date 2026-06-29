@@ -27,6 +27,6 @@ pub async fn ingest(
         return Err(AppError::InvalidRequest("host must not be empty".to_string()));
     }
     let accepted = batch.samples.len();
-    state.store.insert_samples(&batch.host, &batch.samples);
+    state.store.insert_samples(&batch.host, &batch.samples).await;
     Ok(Json(json!({ "accepted": accepted })))
 }

@@ -31,6 +31,6 @@ pub async fn metrics(
     let since = q.since.unwrap_or_else(|| now_secs() - 3600);
     let host = q.host.as_deref().filter(|s| !s.is_empty());
     let metric = q.metric.as_deref().filter(|s| !s.is_empty());
-    let rows = state.store.query(host, metric, since);
+    let rows = state.store.query(host, metric, since).await;
     Ok(Json(json!({ "samples": rows })))
 }

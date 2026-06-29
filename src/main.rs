@@ -52,7 +52,9 @@ fn spawn_retention_pruner(state: vitals::AppState) {
         loop {
             tick.tick().await;
             let cutoff = vitals::now_secs() - state.config.retention_secs();
-            let removed = tokio::task::block_in_place(|| state.store.prune(cutoff));
+            // The Store is async: await the prune directly on the serving runtime — no
+            // block_in_place, so the pruner never blocks a worker thread.
+            let removed = state.store.prune(cutoff).await;
             if removed > 0 {
                 tracing::info!(removed, cutoff, "retention prune");
             }

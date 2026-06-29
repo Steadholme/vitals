@@ -46,7 +46,7 @@ async fn ingest_without_token_is_401() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["error"], "unauthorized");
     // Nothing was stored.
-    assert!(state.store.latest().is_empty());
+    assert!(state.store.latest().await.is_empty());
 }
 
 #[tokio::test]
@@ -65,9 +65,9 @@ async fn ingest_with_token_accepts_and_stores() {
     assert_eq!(v["accepted"], 2);
 
     // The samples are queryable.
-    let rows = state.store.query(Some("node-a"), None, 0);
+    let rows = state.store.query(Some("node-a"), None, 0).await;
     assert_eq!(rows.len(), 2);
-    let latest = state.store.latest();
+    let latest = state.store.latest().await;
     assert_eq!(latest.len(), 2);
 }
 

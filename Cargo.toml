@@ -23,9 +23,14 @@ path = "src/agent.rs"
 [dependencies]
 # HTTP framework (shared with keystone/keyward): Json/State/Query extractors, typed responses.
 axum = "0.8"
-# Async runtime axum runs on. multi-thread is load-bearing: the synchronous Store trait
-# bridges to async sqlx via block_in_place (same pattern as keystone/keyward).
+# Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
+# PgStore uses sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
+# multi-thread keeps the serving runtime parallel for concurrent reads under ingest load;
+# `time` backs the retention pruner's interval timer.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (the handlers
+# depend only on the trait, exactly like the keystone/keyward seam).
+async-trait = "0.1"
 # (De)serialize ingest batches / api responses / dashboard models.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

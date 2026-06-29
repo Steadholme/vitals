@@ -11,23 +11,29 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
+
 use crate::metrics::{Sample, SampleRow};
 
-/// Pluggable metric TSDB. No `.await` is ever held across the internal lock.
+/// Pluggable metric TSDB. Methods are `async`: the axum handlers (and the retention pruner)
+/// `.await` them directly on the serving runtime, so a query never blocks a worker thread.
+/// The in-memory store's `std::sync::Mutex` is taken and dropped within a single synchronous
+/// section (no `.await` inside), so the guard is never held across a yield point.
+#[async_trait]
 pub trait Store: Send + Sync {
     /// Append a host's scrape batch. Idempotent per `(host, metric, ts)` (first write wins).
-    fn insert_samples(&self, host: &str, samples: &[Sample]);
+    async fn insert_samples(&self, host: &str, samples: &[Sample]);
 
     /// Return rows matching the filters, ordered by `(host, metric, ts)`:
     /// - `host`/`metric` `None` means "any";
     /// - `since` is an inclusive lower bound on `ts`.
-    fn query(&self, host: Option<&str>, metric: Option<&str>, since: i64) -> Vec<SampleRow>;
+    async fn query(&self, host: Option<&str>, metric: Option<&str>, since: i64) -> Vec<SampleRow>;
 
     /// The most-recent sample for every `(host, metric)` pair (the dashboard's gauges).
-    fn latest(&self) -> Vec<SampleRow>;
+    async fn latest(&self) -> Vec<SampleRow>;
 
     /// Delete samples with `ts < older_than`. Returns the number of rows removed.
-    fn prune(&self, older_than: i64) -> u64;
+    async fn prune(&self, older_than: i64) -> u64;
 }
 
 /// In-memory `Store`. `std::sync::Mutex<Vec>` — no async lock needed. The default when
@@ -43,8 +49,11 @@ impl InMemoryStore {
     }
 }
 
+#[async_trait]
 impl Store for InMemoryStore {
-    fn insert_samples(&self, host: &str, samples: &[Sample]) {
+    async fn insert_samples(&self, host: &str, samples: &[Sample]) {
+        // The whole critical section is synchronous (no `.await` inside), so the std `Mutex`
+        // guard is never held across a yield point.
         let mut rows = self.rows.lock().expect("rows lock poisoned");
         // Mirror Postgres' `ON CONFLICT (host, metric, ts) DO NOTHING`: first write wins.
         let mut seen: HashSet<(&str, &str, i64)> = rows
@@ -68,7 +77,7 @@ impl Store for InMemoryStore {
         rows.extend(to_add);
     }
 
-    fn query(&self, host: Option<&str>, metric: Option<&str>, since: i64) -> Vec<SampleRow> {
+    async fn query(&self, host: Option<&str>, metric: Option<&str>, since: i64) -> Vec<SampleRow> {
         let rows = self.rows.lock().expect("rows lock poisoned");
         let mut out: Vec<SampleRow> = rows
             .iter()
@@ -86,7 +95,7 @@ impl Store for InMemoryStore {
         out
     }
 
-    fn latest(&self) -> Vec<SampleRow> {
+    async fn latest(&self) -> Vec<SampleRow> {
         use std::collections::HashMap;
         let rows = self.rows.lock().expect("rows lock poisoned");
         let mut best: HashMap<(String, String), SampleRow> = HashMap::new();
@@ -104,7 +113,7 @@ impl Store for InMemoryStore {
         out
     }
 
-    fn prune(&self, older_than: i64) -> u64 {
+    async fn prune(&self, older_than: i64) -> u64 {
         let mut rows = self.rows.lock().expect("rows lock poisoned");
         let before = rows.len();
         rows.retain(|r| r.ts >= older_than);
@@ -116,44 +125,33 @@ impl Store for InMemoryStore {
 // PostgreSQL-backed `Store` (portable: standard SQL, runtime queries, no macros).
 // --------------------------------------------------------------------------------------
 //
-// Selected at runtime by `VITALS_STORE=postgres`. The `Store` trait is synchronous
-// (handlers never `.await` the store), so each method bridges to async sqlx via
-// `block_in_place` + the runtime `Handle` — the same pattern keystone/keyward use. This
-// needs a multi-threaded Tokio runtime, which production (`#[tokio::main]`) and the
-// `multi_thread` integration test both provide.
+// Selected at runtime by `VITALS_STORE=postgres`. The `Store` trait is async, so each method
+// drives sqlx natively and the handlers (plus the retention pruner) `.await` it on the serving
+// runtime — there is NO `block_in_place` and NO sync-over-async bridge, so a query under ingest
+// load never blocks a worker thread or wedges `/healthz`.
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
-/// PostgreSQL-backed [`Store`]. Holds a `PgPool` plus the runtime [`Handle`] used to drive
-/// async queries to completion from the synchronous trait methods.
-///
-/// [`Handle`]: tokio::runtime::Handle
+/// PostgreSQL-backed [`Store`]. Holds just a `PgPool`; the async trait methods drive sqlx
+/// natively, so no worker thread is ever blocked on a DB round-trip.
 pub struct PgStore {
     pool: PgPool,
-    handle: tokio::runtime::Handle,
 }
 
 impl PgStore {
-    /// Open a pooled connection. Captures the current runtime handle for the sync→async
-    /// bridge; must be called from within a Tokio runtime.
+    /// Open a pooled connection. Async; call from within a Tokio runtime.
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .connect(database_url)
             .await?;
-        Ok(Self {
-            pool,
-            handle: tokio::runtime::Handle::current(),
-        })
+        Ok(Self::from_pool(pool))
     }
 
     /// Construct from an existing pool (used by tests that share a pool).
     pub fn from_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            handle: tokio::runtime::Handle::current(),
-        }
+        Self { pool }
     }
 
     /// Idempotent, portable migration. Standard SQL only — safe to run on every startup.
@@ -261,37 +259,34 @@ impl PgStore {
             ts: row.get("ts"),
         }
     }
-
-    /// Drive an async DB op to completion from a synchronous trait method.
-    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
-        tokio::task::block_in_place(|| self.handle.block_on(fut))
-    }
 }
 
+#[async_trait]
 impl Store for PgStore {
-    fn insert_samples(&self, host: &str, samples: &[Sample]) {
-        if let Err(e) = self.block_on(self.insert_samples_async(host, samples)) {
+    async fn insert_samples(&self, host: &str, samples: &[Sample]) {
+        if let Err(e) = self.insert_samples_async(host, samples).await {
             tracing::error!(error = %e, "pg insert_samples failed");
         }
     }
 
-    fn query(&self, host: Option<&str>, metric: Option<&str>, since: i64) -> Vec<SampleRow> {
-        self.block_on(self.query_async(host, metric, since))
+    async fn query(&self, host: Option<&str>, metric: Option<&str>, since: i64) -> Vec<SampleRow> {
+        self.query_async(host, metric, since)
+            .await
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, "pg query failed");
                 Vec::new()
             })
     }
 
-    fn latest(&self) -> Vec<SampleRow> {
-        self.block_on(self.latest_async()).unwrap_or_else(|e| {
+    async fn latest(&self) -> Vec<SampleRow> {
+        self.latest_async().await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg latest failed");
             Vec::new()
         })
     }
 
-    fn prune(&self, older_than: i64) -> u64 {
-        self.block_on(self.prune_async(older_than)).unwrap_or_else(|e| {
+    async fn prune(&self, older_than: i64) -> u64 {
+        self.prune_async(older_than).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg prune failed");
             0
         })
