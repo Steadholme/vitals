@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::analytics;
 use crate::metrics::{self, SampleRow};
+use crate::store::Anomaly;
 
 const APP_CSS: &str = include_str!("../static/app.css");
 
@@ -21,6 +23,10 @@ pub struct HostView {
     pub spark_cpu: Vec<f64>,
     /// Recent mem_pct series (oldest -> newest) for the sparkline.
     pub spark_mem: Vec<f64>,
+    /// Short-term linear projection of cpu_pct beyond the window (dashed sparkline tail).
+    pub forecast_cpu: Vec<f64>,
+    /// Short-term linear projection of mem_pct beyond the window.
+    pub forecast_mem: Vec<f64>,
     /// Epoch seconds of this host's most recent sample (freshness).
     pub last_ts: i64,
 }
@@ -35,7 +41,11 @@ impl HostView {
 ///
 /// `latest` carries one row per `(host, metric)`; `window` carries the recent cpu_pct /
 /// mem_pct series used for sparklines (ordered by `(host, metric, ts)`).
-pub fn build_host_views(latest: &[SampleRow], window: &[SampleRow]) -> Vec<HostView> {
+pub fn build_host_views(
+    latest: &[SampleRow],
+    window: &[SampleRow],
+    forecast_steps: usize,
+) -> Vec<HostView> {
     let mut by_host: BTreeMap<String, HostView> = BTreeMap::new();
     for r in latest {
         let hv = by_host.entry(r.host.clone()).or_insert_with(|| HostView {
@@ -56,16 +66,29 @@ pub fn build_host_views(latest: &[SampleRow], window: &[SampleRow]) -> Vec<HostV
             _ => {}
         }
     }
+    // Short-term linear forecast over each host's recent cpu/mem series (Augur's projection,
+    // folded in). Skipped when the window is too thin to fit a line.
+    if forecast_steps > 0 {
+        for hv in by_host.values_mut() {
+            if hv.spark_cpu.len() >= 2 {
+                hv.forecast_cpu = analytics::forecast(&hv.spark_cpu, forecast_steps).points;
+            }
+            if hv.spark_mem.len() >= 2 {
+                hv.forecast_mem = analytics::forecast(&hv.spark_mem, forecast_steps).points;
+            }
+        }
+    }
     by_host.into_values().collect()
 }
 
 /// Render the whole dashboard document.
-pub fn render(hosts: &[HostView], email: &str, now: i64) -> String {
+pub fn render(hosts: &[HostView], anomalies: &[Anomaly], email: &str, now: i64) -> String {
     let cards: String = if hosts.is_empty() {
         empty_state()
     } else {
         hosts.iter().map(|h| host_card(h, now)).collect()
     };
+    let anomaly_panel = anomalies_panel(anomalies, now);
     let online = hosts.iter().filter(|h| now - h.last_ts <= 60).count();
 
     format!(
@@ -99,6 +122,7 @@ pub fn render(hosts: &[HostView], email: &str, now: i64) -> String {
       <span class="pill pill--muted">{total} 主机</span>
     </div>
   </div>
+  {anomaly_panel}
   <div class="grid">{cards}</div>
 </main>
 </body>
@@ -108,7 +132,53 @@ pub fn render(hosts: &[HostView], email: &str, now: i64) -> String {
         userbox = userbox(email),
         online = online,
         total = hosts.len(),
+        anomaly_panel = anomaly_panel,
         cards = cards,
+    )
+}
+
+/// The estate anomaly watch: recent self-baseline anomalies the background detector recorded
+/// (host/metric, when, z-score, value, note). Hidden entirely when nothing is flagged so a calm
+/// estate shows a clean dashboard. Folded in from the retired Augur service.
+fn anomalies_panel(anomalies: &[Anomaly], now: i64) -> String {
+    if anomalies.is_empty() {
+        return String::new();
+    }
+    let rows: String = anomalies
+        .iter()
+        .map(|a| {
+            format!(
+                r#"<tr>
+  <td><span class="mono">{host}</span> · {metric}</td>
+  <td><span class="tag tag-down">z = {z}</span></td>
+  <td>{value}</td>
+  <td class="muted">{when}</td>
+  <td class="muted">{note}</td>
+</tr>"#,
+                host = esc(&a.host),
+                metric = esc(&a.metric),
+                z = esc(&format!("{:.2}", a.score)),
+                value = esc(&format!("{:.3}", a.value)),
+                when = esc(&format!("{} 前", human_age(now - a.ts))),
+                note = esc(&a.note),
+            )
+        })
+        .collect();
+    format!(
+        r#"<section class="card">
+  <div class="card__head">
+    <h2>异常监测 · Anomaly Watch</h2>
+    <span class="pill pill--warn">{n} 异常</span>
+  </div>
+  <div class="card__body">
+    <table>
+      <thead><tr><th>指标 Series</th><th>z-score</th><th>当前值</th><th>时间</th><th>说明</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>"#,
+        n = anomalies.len(),
+        rows = rows,
     )
 }
 
@@ -225,8 +295,8 @@ fn host_card(h: &HostView, now: i64) -> String {
         pill_class = pill_class,
         pill_text = esc(&pill_text),
         gauges = gauges,
-        spark_cpu = sparkline(&h.spark_cpu, 100.0, "var(--accent)"),
-        spark_mem = sparkline(&h.spark_mem, 100.0, "var(--success)"),
+        spark_cpu = sparkline(&h.spark_cpu, &h.forecast_cpu, 100.0, "var(--accent)"),
+        spark_mem = sparkline(&h.spark_mem, &h.forecast_mem, 100.0, "var(--success)"),
         mem_detail = esc(&mem_detail),
         disk_detail = esc(&disk_detail),
         load_detail = esc(&load_detail),
@@ -250,9 +320,10 @@ fn gauge(label: &str, fill_pct: Option<f64>, value_text: String, tone: &str) -> 
     )
 }
 
-/// Inline SVG sparkline. `max` scales the y-axis; `stroke` is a CSS colour. Empty series
-/// render a flat baseline so the layout never jumps.
-fn sparkline(values: &[f64], max: f64, stroke: &str) -> String {
+/// Inline SVG sparkline. `max` scales the y-axis; `stroke` is a CSS colour. `forecast` is the
+/// short-term linear projection drawn as a dashed continuation beyond the history (empty = none).
+/// Empty `values` render a flat baseline so the layout never jumps.
+fn sparkline(values: &[f64], forecast: &[f64], max: f64, stroke: &str) -> String {
     const W: f64 = 240.0;
     const H: f64 = 44.0;
     if values.len() < 2 {
@@ -267,28 +338,50 @@ fn sparkline(values: &[f64], max: f64, stroke: &str) -> String {
     }
     let n = values.len();
     let max = if max <= 0.0 { 1.0 } else { max };
+    // x-axis spans history + forecast so the projection has room on the right.
+    let total = n + forecast.len();
+    let span = (total - 1).max(1) as f64;
+    let x_at = |i: usize| i as f64 / span * W;
+    let y_at = |v: f64| H - (v.clamp(0.0, max) / max) * H;
+
     let pts: String = values
         .iter()
         .enumerate()
-        .map(|(i, v)| {
-            let x = i as f64 / (n - 1) as f64 * W;
-            let y = H - (v.clamp(0.0, max) / max) * H;
-            format!("{x:.1},{y:.1}")
-        })
+        .map(|(i, v)| format!("{:.1},{:.1}", x_at(i), y_at(*v)))
         .collect::<Vec<_>>()
         .join(" ");
-    // Area fill polygon: the line points plus the bottom corners.
-    let area = format!("0,{H} {pts} {W},{H}", H = H, pts = pts, W = W);
+    // Area fill polygon: the history line points plus the bottom corners (history span only).
+    let hist_right = x_at(n - 1);
+    let area = format!("0,{H} {pts} {hx:.1},{H}", H = H, pts = pts, hx = hist_right);
+
+    // Dashed forecast continuation: anchor at the last real point, then the projected points.
+    let forecast_line = if forecast.is_empty() {
+        String::new()
+    } else {
+        let mut fp: Vec<String> = Vec::with_capacity(forecast.len() + 1);
+        fp.push(format!("{:.1},{:.1}", x_at(n - 1), y_at(values[n - 1])));
+        for (k, v) in forecast.iter().enumerate() {
+            fp.push(format!("{:.1},{:.1}", x_at(n + k), y_at(*v)));
+        }
+        format!(
+            r#"
+  <polyline points="{fpts}" fill="none" stroke="{stroke}" stroke-width="1.5" stroke-dasharray="3 3" stroke-opacity="0.7" stroke-linejoin="round" stroke-linecap="round"/>"#,
+            fpts = fp.join(" "),
+            stroke = stroke,
+        )
+    };
+
     format!(
         r#"<svg class="spark__svg" viewBox="0 0 {W} {H}" preserveAspectRatio="none" role="img" aria-label="trend">
   <polygon points="{area}" fill="{stroke}" fill-opacity="0.10"/>
-  <polyline points="{pts}" fill="none" stroke="{stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+  <polyline points="{pts}" fill="none" stroke="{stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>{forecast_line}
 </svg>"#,
         W = W,
         H = H,
         area = area,
         pts = pts,
         stroke = stroke,
+        forecast_line = forecast_line,
     )
 }
 

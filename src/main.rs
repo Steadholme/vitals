@@ -33,6 +33,12 @@ async fn main() {
 
     spawn_retention_pruner(state.clone());
 
+    // Background self-baselining anomaly detector (folded in from the retired Augur service).
+    // Detached + isolated from the ingest write path; gated by VITALS_DETECT (default on).
+    if state.config.detect_enabled {
+        vitals::detector::spawn_detector(state.clone());
+    }
+
     let retention = state.config.retention_hours;
     let app = vitals::app(state);
 

@@ -12,10 +12,14 @@
 //! - `GET  /api/metrics`    JSON time-series (behind the gateway `auth=sso` route)
 //! - `GET  /`               the dashboard       (behind the gateway `auth=sso` route)
 
+pub mod analytics;
+pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod detector;
 pub mod error;
 pub mod handlers;
+pub mod klaxon;
 pub mod metrics;
 pub mod probe;
 pub mod render;
@@ -27,14 +31,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::routing::{get, post};
 use axum::Router;
 
+use crate::audit::AuditSink;
 use crate::config::ServerConfig;
 use crate::store::{InMemoryStore, PgStore, Store};
 
-/// Shared application state. Cheap to clone (everything behind `Arc`).
+/// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub store: Arc<dyn Store>,
+    /// Non-blocking Watchtower audit emitter (disabled by default in dev/tests).
+    pub audit: AuditSink,
 }
 
 /// Build the router wiring all server endpoints onto `state`.
@@ -43,6 +50,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/api/metrics", get(handlers::api::metrics))
+        .route("/api/anomalies", get(handlers::api::anomalies))
         .route("/", get(handlers::dashboard::dashboard))
         // Sluice forwards the gateway prefix UNMODIFIED (no strip), so a request to the
         // `/vitals` route arrives here as `GET /vitals`. Register the dashboard as the
@@ -57,6 +65,7 @@ pub fn build_dev_state() -> AppState {
     AppState {
         config: Arc::new(ServerConfig::dev()),
         store: Arc::new(InMemoryStore::new()),
+        audit: AuditSink::disabled(),
     }
 }
 
@@ -90,9 +99,26 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         other => return Err(format!("unknown VITALS_STORE={other} (use memory|postgres)")),
     };
 
+    // Non-blocking Watchtower audit emitter — enabled by AUDIT_ENABLED + WATCHTOWER_URL +
+    // AUDIT_INGEST_TOKEN. A misconfiguration only warns and turns audit OFF (never fails startup).
+    let audit_enabled = matches!(
+        std::env::var("AUDIT_ENABLED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    );
+    let audit = AuditSink::start(
+        audit_enabled,
+        &std::env::var("WATCHTOWER_URL").unwrap_or_default(),
+        std::env::var("AUDIT_INGEST_TOKEN").ok().as_deref(),
+    );
+
     Ok(AppState {
         config: Arc::new(config),
         store,
+        audit,
     })
 }
 

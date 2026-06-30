@@ -26,7 +26,11 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Htm
     let now = now_secs();
     let latest = state.store.latest().await;
     let window = state.store.query(None, None, now - SPARK_WINDOW_SECS).await;
-    let hosts = build_host_views(&latest, &window);
+    let hosts = build_host_views(&latest, &window, state.config.forecast_steps);
+    let anomalies = state
+        .store
+        .recent_anomalies(None, None, crate::config::ANOMALY_LIMIT)
+        .await;
 
-    Html(render(&hosts, email, now))
+    Html(render(&hosts, &anomalies, email, now))
 }

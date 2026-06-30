@@ -12,8 +12,37 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::metrics::{Sample, SampleRow};
+
+/// One recorded anomaly (maps 1:1 to an `anomalies` row). A `(host, metric)` series whose
+/// latest sample drifts `|z| >= z_threshold` from the baseline of its preceding points is
+/// recorded here once per `(host, metric, ts)` — the same self-baseline detection Augur ran,
+/// now folded into Vitals so there is no second TSDB and no scrape hop.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Anomaly {
+    pub host: String,
+    pub metric: String,
+    pub ts: i64,
+    pub value: f64,
+    /// Signed z-score of `value` against the preceding window's baseline.
+    pub score: f64,
+    pub note: String,
+}
+
+impl Anomaly {
+    pub fn new(host: &str, metric: &str, ts: i64, value: f64, score: f64, note: String) -> Self {
+        Anomaly {
+            host: host.to_string(),
+            metric: metric.to_string(),
+            ts,
+            value,
+            score,
+            note,
+        }
+    }
+}
 
 /// Pluggable metric TSDB. Methods are `async`: the axum handlers (and the retention pruner)
 /// `.await` them directly on the serving runtime, so a query never blocks a worker thread.
@@ -34,6 +63,23 @@ pub trait Store: Send + Sync {
 
     /// Delete samples with `ts < older_than`. Returns the number of rows removed.
     async fn prune(&self, older_than: i64) -> u64;
+
+    /// The most-recent `limit` samples for one `(host, metric)` series, returned OLDEST-first
+    /// (ascending `ts`) so the last element is the latest sample — the order the analytics expect.
+    /// Drives the background anomaly detector and the dashboard forecast.
+    async fn recent_samples(&self, host: &str, metric: &str, limit: i64) -> Vec<SampleRow>;
+
+    /// Record one anomaly. Idempotent on `(host, metric, ts)` — returns `true` only when newly
+    /// inserted, so repeated detection of the same latest sample emits exactly once.
+    async fn record_anomaly(&self, anomaly: &Anomaly) -> bool;
+
+    /// Recent anomalies, newest-first, capped at `limit`. `host`/`metric` `None` means "any".
+    async fn recent_anomalies(
+        &self,
+        host: Option<&str>,
+        metric: Option<&str>,
+        limit: i64,
+    ) -> Vec<Anomaly>;
 }
 
 /// In-memory `Store`. `std::sync::Mutex<Vec>` — no async lock needed. The default when
@@ -41,6 +87,7 @@ pub trait Store: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryStore {
     rows: Mutex<Vec<SampleRow>>,
+    anomalies: Mutex<Vec<Anomaly>>,
 }
 
 impl InMemoryStore {
@@ -119,6 +166,57 @@ impl Store for InMemoryStore {
         rows.retain(|r| r.ts >= older_than);
         (before - rows.len()) as u64
     }
+
+    async fn recent_samples(&self, host: &str, metric: &str, limit: i64) -> Vec<SampleRow> {
+        let rows = self.rows.lock().expect("rows lock poisoned");
+        let mut v: Vec<SampleRow> = rows
+            .iter()
+            .filter(|r| r.host == host && r.metric == metric)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.ts.cmp(&b.ts));
+        let limit = limit.max(0) as usize;
+        if v.len() > limit {
+            v.drain(0..v.len() - limit);
+        }
+        v
+    }
+
+    async fn record_anomaly(&self, anomaly: &Anomaly) -> bool {
+        let mut anomalies = self.anomalies.lock().expect("anomalies lock poisoned");
+        // Mirror Postgres' `ON CONFLICT (host, metric, ts) DO NOTHING`: first write wins.
+        if anomalies
+            .iter()
+            .any(|a| a.host == anomaly.host && a.metric == anomaly.metric && a.ts == anomaly.ts)
+        {
+            return false;
+        }
+        anomalies.push(anomaly.clone());
+        true
+    }
+
+    async fn recent_anomalies(
+        &self,
+        host: Option<&str>,
+        metric: Option<&str>,
+        limit: i64,
+    ) -> Vec<Anomaly> {
+        let anomalies = self.anomalies.lock().expect("anomalies lock poisoned");
+        let mut v: Vec<Anomaly> = anomalies
+            .iter()
+            .filter(|a| host.is_none_or(|h| a.host == h))
+            .filter(|a| metric.is_none_or(|m| a.metric == m))
+            .cloned()
+            .collect();
+        // Newest-first; ties broken by (host, metric) for a stable order.
+        v.sort_by(|a, b| {
+            b.ts.cmp(&a.ts)
+                .then(a.host.cmp(&b.host))
+                .then(a.metric.cmp(&b.metric))
+        });
+        v.truncate(limit.max(0) as usize);
+        v
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -172,6 +270,26 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_metric_samples_host_metric_ts \
                  ON metric_samples (host, metric, ts)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Anomalies recorded by the background detector (one per (host, metric, ts), deduped).
+        // Folded in from the retired Augur service — standard SQL only, runs unchanged on FusionDB.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS anomalies (\
+                 host TEXT NOT NULL, \
+                 metric TEXT NOT NULL, \
+                 ts BIGINT NOT NULL, \
+                 value DOUBLE PRECISION NOT NULL, \
+                 score DOUBLE PRECISION NOT NULL, \
+                 note TEXT NOT NULL DEFAULT '', \
+                 PRIMARY KEY (host, metric, ts)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_anomalies_ts ON anomalies (ts)",
         )
         .execute(&self.pool)
         .await?;
@@ -259,6 +377,75 @@ impl PgStore {
             ts: row.get("ts"),
         }
     }
+
+    fn anomaly_from(row: &sqlx::postgres::PgRow) -> Anomaly {
+        Anomaly {
+            host: row.get("host"),
+            metric: row.get("metric"),
+            ts: row.get("ts"),
+            value: row.get("value"),
+            score: row.get("score"),
+            note: row.get("note"),
+        }
+    }
+
+    async fn recent_samples_async(
+        &self,
+        host: &str,
+        metric: &str,
+        limit: i64,
+    ) -> Result<Vec<SampleRow>, sqlx::Error> {
+        // Pull the newest `limit` by ts DESC, then reverse to ascending for the analytics.
+        let rows = sqlx::query(
+            "SELECT host, metric, value, ts FROM metric_samples \
+             WHERE host = $1 AND metric = $2 ORDER BY ts DESC LIMIT $3",
+        )
+        .bind(host)
+        .bind(metric)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut v: Vec<SampleRow> = rows.iter().map(Self::row_from).collect();
+        v.reverse();
+        Ok(v)
+    }
+
+    async fn record_anomaly_async(&self, a: &Anomaly) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "INSERT INTO anomalies (host, metric, ts, value, score, note) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (host, metric, ts) DO NOTHING",
+        )
+        .bind(&a.host)
+        .bind(&a.metric)
+        .bind(a.ts)
+        .bind(a.value)
+        .bind(a.score)
+        .bind(&a.note)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn recent_anomalies_async(
+        &self,
+        host: Option<&str>,
+        metric: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Anomaly>, sqlx::Error> {
+        // Stable parameter positions: $1 host-or-null, $2 metric-or-null, $3 limit.
+        let rows = sqlx::query(
+            "SELECT host, metric, ts, value, score, note FROM anomalies \
+             WHERE ($1 IS NULL OR host = $1) \
+               AND ($2 IS NULL OR metric = $2) \
+             ORDER BY ts DESC, host, metric LIMIT $3",
+        )
+        .bind(host)
+        .bind(metric)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::anomaly_from).collect())
+    }
 }
 
 #[async_trait]
@@ -290,5 +477,84 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg prune failed");
             0
         })
+    }
+
+    async fn recent_samples(&self, host: &str, metric: &str, limit: i64) -> Vec<SampleRow> {
+        self.recent_samples_async(host, metric, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg recent_samples failed");
+                Vec::new()
+            })
+    }
+
+    async fn record_anomaly(&self, anomaly: &Anomaly) -> bool {
+        self.record_anomaly_async(anomaly).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg record_anomaly failed");
+            false
+        })
+    }
+
+    async fn recent_anomalies(
+        &self,
+        host: Option<&str>,
+        metric: Option<&str>,
+        limit: i64,
+    ) -> Vec<Anomaly> {
+        self.recent_anomalies_async(host, metric, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg recent_anomalies failed");
+                Vec::new()
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(metric: &str, value: f64, ts: i64) -> Sample {
+        Sample::new(metric, value, ts)
+    }
+
+    #[tokio::test]
+    async fn recent_samples_is_ascending_tail_per_pair() {
+        let store = InMemoryStore::new();
+        for ts in 0..10i64 {
+            store.insert_samples("box", &[s("cpu_pct", ts as f64, ts)]).await;
+        }
+        // A different host/metric must not leak into the window.
+        store.insert_samples("other", &[s("cpu_pct", 99.0, 5)]).await;
+        store.insert_samples("box", &[s("mem_pct", 99.0, 5)]).await;
+
+        let w = store.recent_samples("box", "cpu_pct", 3).await;
+        assert_eq!(w.iter().map(|r| r.ts).collect::<Vec<_>>(), [7, 8, 9]);
+        assert!(w.iter().all(|r| r.host == "box" && r.metric == "cpu_pct"));
+    }
+
+    #[tokio::test]
+    async fn anomaly_dedup_and_filter() {
+        let store = InMemoryStore::new();
+        assert!(
+            store
+                .record_anomaly(&Anomaly::new("box", "cpu_pct", 100, 99.0, 5.0, "z=5".into()))
+                .await
+        );
+        // Same (host, metric, ts) -> no second row (first write wins).
+        assert!(
+            !store
+                .record_anomaly(&Anomaly::new("box", "cpu_pct", 100, 99.0, 6.0, "z=6".into()))
+                .await
+        );
+        store
+            .record_anomaly(&Anomaly::new("box", "mem_pct", 200, 80.0, 4.0, "z=4".into()))
+            .await;
+
+        assert_eq!(store.recent_anomalies(Some("box"), Some("cpu_pct"), 10).await.len(), 1);
+        assert_eq!(store.recent_anomalies(Some("box"), None, 10).await.len(), 2);
+        assert_eq!(store.recent_anomalies(None, None, 10).await.len(), 2);
+        // Newest-first across the series.
+        assert_eq!(store.recent_anomalies(None, None, 10).await[0].ts, 200);
     }
 }
