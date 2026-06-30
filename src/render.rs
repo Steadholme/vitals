@@ -84,13 +84,8 @@ pub fn render(hosts: &[HostView], email: &str, now: i64) -> String {
     <a class="brand" href="/" aria-label="HOLDFAST Vitals">
       <span class="brand__glyph" aria-hidden="true">{shield}</span>
       <span class="brand__word">HOLDFAST</span>
-      <span class="brand__sep">/</span>
-      <span class="brand__app">Vitals</span>
     </a>
-    <div class="topbar__right">
-      <span class="user-email" title="signed in">{email}</span>
-      <a class="btn btn-ghost btn-sm" href="/_gw/auth/logout">Logout</a>
-    </div>
+    <div class="topbar__right">{userbox}</div>
   </div>
 </header>
 <main class="wrap">
@@ -110,10 +105,48 @@ pub fn render(hosts: &[HostView], email: &str, now: i64) -> String {
 </html>"#,
         css = APP_CSS,
         shield = SHIELD_SVG,
-        email = esc(email),
+        userbox = userbox(email),
         online = online,
         total = hosts.len(),
         cards = cards,
+    )
+}
+
+/// Cross-subdomain SSO logout (terminated at the gateway / Keystone IdP).
+const LOGOUT_URL: &str = "/_gw/auth/logout";
+
+/// The right side of the app-bar, shared with every HOLDFAST service: a page title, an
+/// "All apps" pill back to the apex portal, the signed-in user chip (avatar initial + email),
+/// and the cross-subdomain logout. `email` is the gateway-injected identity; the unknown
+/// placeholder (`—`) or an empty string renders no user chip (public-page friendly).
+fn userbox(email: &str) -> String {
+    let has_identity = !email.is_empty() && email != "—";
+    let chip = if has_identity {
+        let initial = email
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "H".to_string());
+        format!(
+            "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\" title=\"signed in\">{}</span></span>",
+            esc(&initial),
+            esc(email),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        concat!(
+            "<span class=\"topbar__title\">Vitals</span>",
+            "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
+            "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
+            "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
+            "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
+            "{chip}",
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{logout}\">Logout</a>",
+        ),
+        chip = chip,
+        logout = LOGOUT_URL,
     )
 }
 
