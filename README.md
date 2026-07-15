@@ -136,10 +136,10 @@ docker rm -f pg
 `EXPOSE 8300`，镜像同时携带两个二进制。
 
 ```bash
-docker build -t holdfast/vitals:dev .
+docker build -t steadholme/vitals:dev .
 
 # 服务端
-docker run --rm -p 127.0.0.1:8300:8300 holdfast/vitals:dev
+docker run --rm -p 127.0.0.1:8300:8300 steadholme/vitals:dev
 
 # 探针（覆盖 command，挂载宿主 /proc 等只读，上报真实宿主指标）
 docker run --rm \
@@ -147,7 +147,7 @@ docker run --rm \
   -e INGEST_TOKEN=... \
   -e HOST_PROC=/host/proc -e HOST_SYS=/host/sys -e HOST_ROOT=/host/root \
   -v /proc:/host/proc:ro -v /sys:/host/sys:ro -v /:/host/root:ro \
-  holdfast/vitals:dev vitals-agent
+  steadholme/vitals:dev vitals-agent
 ```
 
 `vitals-agent oneshot` 做一轮采集+上报后退出，便于冒烟验证。
