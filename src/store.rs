@@ -174,7 +174,7 @@ impl Store for InMemoryStore {
             .filter(|r| r.host == host && r.metric == metric)
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.ts.cmp(&b.ts));
+        v.sort_by_key(|a| a.ts);
         let limit = limit.max(0) as usize;
         if v.len() > limit {
             v.drain(0..v.len() - limit);
