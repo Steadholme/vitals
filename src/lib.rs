@@ -1,4 +1,4 @@
-//! Vitals — host probe (探针) + metrics TSDB + enterprise dashboard for the HOLDFAST stack.
+//! Vitals — host probe (探针) + metrics TSDB + enterprise dashboard for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory store, no database) and [`build_state_from_env`]

@@ -1,6 +1,6 @@
 # Vitals — 主机探针 + 指标 TSDB + 仪表盘
 
-HOLDFAST 主权基础设施栈的可观测组件（探针 / 探测器）。由两个二进制组成：
+Steadholme 主权基础设施栈的可观测组件（探针 / 探测器）。由两个二进制组成：
 
 - **`vitals-agent`** — 主机探针。每隔 `SCRAPE_INTERVAL`（默认 10s）从可配置的
   proc/sys 根读取主机指标，向服务端 `/ingest` POST 一个带 `Authorization: Bearer

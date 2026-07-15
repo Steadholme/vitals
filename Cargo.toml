@@ -2,7 +2,7 @@
 name = "vitals"
 version = "0.1.0"
 edition = "2021"
-description = "Vitals — host probe (探针) + metrics TSDB + enterprise dashboard for the HOLDFAST stack."
+description = "Vitals — host probe (探针) + metrics TSDB + enterprise dashboard for the Steadholme stack."
 license = "MIT OR Apache-2.0"
 
 [lib]
