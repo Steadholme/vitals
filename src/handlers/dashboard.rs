@@ -32,5 +32,5 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Htm
         .recent_anomalies(None, None, crate::config::ANOMALY_LIMIT)
         .await;
 
-    Html(render(&hosts, &anomalies, email, now))
+    Html(render(&hosts, &anomalies, &state.config, email, now))
 }

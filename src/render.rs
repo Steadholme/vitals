@@ -3,11 +3,12 @@
 //! Pure functions: a `&[HostView]` + the signed-in email in, an HTML `String` out. The CSS
 //! is embedded (`include_str!`) so the slim image never misses an asset and the page is one
 //! self-contained document. The brand lockup, tokens, app-bar, cards, status pills and
-//! tables match the shared HOLDFAST enterprise design.
+//! tables match the shared Steadholme enterprise design.
 
 use std::collections::BTreeMap;
 
 use crate::analytics;
+use crate::config::ServerConfig;
 use crate::metrics::{self, SampleRow};
 use crate::store::Anomaly;
 
@@ -82,13 +83,20 @@ pub fn build_host_views(
 }
 
 /// Render the whole dashboard document.
-pub fn render(hosts: &[HostView], anomalies: &[Anomaly], email: &str, now: i64) -> String {
+pub fn render(
+    hosts: &[HostView],
+    anomalies: &[Anomaly],
+    config: &ServerConfig,
+    email: &str,
+    now: i64,
+) -> String {
     let cards: String = if hosts.is_empty() {
         empty_state()
     } else {
         hosts.iter().map(|h| host_card(h, now)).collect()
     };
-    let anomaly_panel = anomalies_panel(anomalies, now);
+    let capability_panel = capability_panel(config);
+    let anomaly_panel = anomalies_panel(anomalies, config, now);
     let online = hosts.iter().filter(|h| now - h.last_ts <= 60).count();
 
     format!(
@@ -98,15 +106,15 @@ pub fn render(hosts: &[HostView], anomalies: &[Anomaly], email: &str, now: i64) 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
-<title>Vitals · HOLDFAST</title>
+<title>Vitals · Steadholme</title>
 <style>{css}</style>
 </head>
 <body>
 <header class="topbar">
   <div class="topbar__inner">
-    <a class="brand" href="/" aria-label="HOLDFAST Vitals">
+    <a class="brand" href="/" aria-label="Steadholme Vitals">
       <span class="brand__glyph" aria-hidden="true">{shield}</span>
-      <span class="brand__word">HOLDFAST</span>
+      <span class="brand__word">STEADHOLME</span>
     </a>
     <div class="topbar__right">{userbox}</div>
   </div>
@@ -122,6 +130,7 @@ pub fn render(hosts: &[HostView], anomalies: &[Anomaly], email: &str, now: i64) 
       <span class="pill pill--muted">{total} 主机</span>
     </div>
   </div>
+  {capability_panel}
   {anomaly_panel}
   <div class="grid">{cards}</div>
 </main>
@@ -132,17 +141,121 @@ pub fn render(hosts: &[HostView], anomalies: &[Anomaly], email: &str, now: i64) 
         userbox = userbox(email),
         online = online,
         total = hosts.len(),
+        capability_panel = capability_panel,
         anomaly_panel = anomaly_panel,
         cards = cards,
     )
 }
 
+/// Always-visible inventory of the capabilities that otherwise sit behind APIs, background tasks,
+/// env-driven integrations, or small visual affordances like dashed forecast tails.
+fn capability_panel(config: &ServerConfig) -> String {
+    let detect_class = if config.detect_enabled {
+        "pill--ok"
+    } else {
+        "pill--muted"
+    };
+    let detect_text = if config.detect_enabled {
+        "检测开启"
+    } else {
+        "检测关闭"
+    };
+    let klaxon_text = if config.klaxon_ready() {
+        "已连接"
+    } else {
+        "未配置"
+    };
+    let klaxon_class = if config.klaxon_ready() {
+        "pill--ok"
+    } else {
+        "pill--muted"
+    };
+    let metrics = [
+        metrics::M_CPU_PCT,
+        metrics::M_MEM_PCT,
+        metrics::M_MEM_USED,
+        metrics::M_MEM_TOTAL,
+        metrics::M_DISK_PCT,
+        metrics::M_DISK_USED,
+        metrics::M_DISK_TOTAL,
+        metrics::M_LOAD1,
+        metrics::M_LOAD5,
+        metrics::M_LOAD15,
+        metrics::M_NET_RX,
+        metrics::M_NET_TX,
+        metrics::M_UPTIME,
+    ]
+    .iter()
+    .map(|m| format!(r#"<span class="tag mono">{}</span>"#, esc(m)))
+    .collect::<String>();
+
+    format!(
+        r#"<section class="card capability-card">
+  <div class="card__head">
+    <h2>运行能力 · Runtime Surface</h2>
+    <span class="pill {detect_class}">{detect_text}</span>
+  </div>
+  <div class="card__body">
+    <div class="capability-grid">
+      <div class="capability-item"><span class="capability-item__label">采集入口</span><span class="capability-item__value mono">POST /ingest</span><span class="muted">Bearer INGEST_TOKEN</span></div>
+      <div class="capability-item"><span class="capability-item__label">JSON API</span><span class="capability-item__value"><a href="/api/metrics">/api/metrics</a> · <a href="/api/anomalies">/api/anomalies</a></span><span class="muted">支持 host / metric 过滤</span></div>
+      <div class="capability-item"><span class="capability-item__label">异常检测</span><span class="capability-item__value">z ≥ {z}</span><span class="muted">{detect_secs}s cadence · {window} samples</span></div>
+      <div class="capability-item"><span class="capability-item__label">预测</span><span class="capability-item__value">{forecast_steps} steps</span><span class="muted">CPU / MEM 虚线延伸</span></div>
+      <div class="capability-item"><span class="capability-item__label">保留期</span><span class="capability-item__value">{retention_hours}h</span><span class="muted">后台定时裁剪</span></div>
+      <div class="capability-item"><span class="capability-item__label">Klaxon 通知</span><span class="pill {klaxon_class}">{klaxon_text}</span><span class="muted">异常时 best-effort 通知</span></div>
+    </div>
+    <div class="metric-strip" aria-label="采集指标词表">{metrics}</div>
+  </div>
+</section>"#,
+        detect_class = detect_class,
+        detect_text = detect_text,
+        z = esc(&format!("{:.2}", config.z_threshold)),
+        detect_secs = config.detect_secs,
+        window = config.window,
+        forecast_steps = config.forecast_steps,
+        retention_hours = config.retention_hours,
+        klaxon_class = klaxon_class,
+        klaxon_text = klaxon_text,
+        metrics = metrics,
+    )
+}
+
 /// The estate anomaly watch: recent self-baseline anomalies the background detector recorded
-/// (host/metric, when, z-score, value, note). Hidden entirely when nothing is flagged so a calm
-/// estate shows a clean dashboard. Folded in from the retired Augur service.
-fn anomalies_panel(anomalies: &[Anomaly], now: i64) -> String {
+/// (host/metric, when, z-score, value, note). Folded in from the retired Augur service.
+fn anomalies_panel(anomalies: &[Anomaly], config: &ServerConfig, now: i64) -> String {
     if anomalies.is_empty() {
-        return String::new();
+        let (pill_class, pill_text, body) = if config.detect_enabled {
+            (
+                "pill--ok",
+                "0 异常",
+                format!(
+                    "当前没有超过 z ≥ {} 的自基线异常。检测每 {}s 运行一次，窗口 {} 个样本。",
+                    esc(&format!("{:.2}", config.z_threshold)),
+                    config.detect_secs,
+                    config.window,
+                ),
+            )
+        } else {
+            (
+                "pill--muted",
+                "检测关闭",
+                "VITALS_DETECT 当前关闭；历史异常仍可通过 /api/anomalies 查询。".to_string(),
+            )
+        };
+        return format!(
+            r#"<section class="card anomaly-card">
+  <div class="card__head">
+    <h2>异常监测 · Anomaly Watch</h2>
+    <span class="pill {pill_class}">{pill_text}</span>
+  </div>
+  <div class="card__body">
+    <p class="muted">{body}</p>
+  </div>
+</section>"#,
+            pill_class = pill_class,
+            pill_text = pill_text,
+            body = body,
+        );
     }
     let rows: String = anomalies
         .iter()
@@ -165,7 +278,7 @@ fn anomalies_panel(anomalies: &[Anomaly], now: i64) -> String {
         })
         .collect();
     format!(
-        r#"<section class="card">
+        r#"<section class="card anomaly-card">
   <div class="card__head">
     <h2>异常监测 · Anomaly Watch</h2>
     <span class="pill pill--warn">{n} 异常</span>
@@ -185,7 +298,7 @@ fn anomalies_panel(anomalies: &[Anomaly], now: i64) -> String {
 /// Cross-subdomain SSO logout (terminated at the gateway / Keystone IdP).
 const LOGOUT_URL: &str = "/_gw/auth/logout";
 
-/// The right side of the app-bar, shared with every HOLDFAST service: a page title, an
+/// The right side of the app-bar, shared with every Steadholme service: a page title, an
 /// "All apps" pill back to the apex portal, the signed-in user chip (avatar initial + email),
 /// and the cross-subdomain logout. `email` is the gateway-injected identity; the unknown
 /// placeholder (`—`) or an empty string renders no user chip (public-page friendly).
@@ -241,7 +354,12 @@ fn host_card(h: &HostView, now: i64) -> String {
         gauge("CPU", cpu, pct_fmt(cpu), pct_tone(cpu)),
         gauge("内存 MEM", mem, pct_fmt(mem), pct_tone(mem)),
         gauge("磁盘 DISK", disk, pct_fmt(disk), pct_tone(disk)),
-        gauge("负载 LOAD", load.map(|v| (v * 10.0).min(100.0)), load_fmt(load), load_tone(load)),
+        gauge(
+            "负载 LOAD",
+            load.map(|v| (v * 10.0).min(100.0)),
+            load_fmt(load),
+            load_tone(load)
+        ),
     );
 
     let mem_detail = match (h.g(metrics::M_MEM_USED), h.g(metrics::M_MEM_TOTAL)) {
@@ -252,7 +370,11 @@ fn host_card(h: &HostView, now: i64) -> String {
         (Some(u), Some(t)) => format!("{} / {}", human_bytes(u), human_bytes(t)),
         _ => "—".to_string(),
     };
-    let load_detail = match (h.g(metrics::M_LOAD1), h.g(metrics::M_LOAD5), h.g(metrics::M_LOAD15)) {
+    let load_detail = match (
+        h.g(metrics::M_LOAD1),
+        h.g(metrics::M_LOAD5),
+        h.g(metrics::M_LOAD15),
+    ) {
         (Some(a), Some(b), Some(c)) => format!("{a:.2} · {b:.2} · {c:.2}"),
         _ => "—".to_string(),
     };
@@ -396,11 +518,13 @@ fn empty_state() -> String {
 // --- formatting helpers ----------------------------------------------------------------
 
 fn pct_fmt(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.1}%")).unwrap_or_else(|| "—".to_string())
+    v.map(|x| format!("{x:.1}%"))
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn load_fmt(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "—".to_string())
+    v.map(|x| format!("{x:.2}"))
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Tone class for a percentage gauge: green < 70 < amber < 90 < red.
@@ -474,7 +598,7 @@ pub fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// HOLDFAST shield glyph (indigo gradient), shared with the Keystone/console app-bar.
+/// Steadholme shield glyph (indigo gradient), shared with the Keystone/console app-bar.
 const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
 <defs><linearGradient id="hf-shield-v" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse">
 <stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs>
